@@ -1,14 +1,17 @@
+# debug_degradation.py
+
 from pathlib import Path
 
 import torch
-from torchvision.utils import save_image, make_grid
+from torchvision.utils import make_grid, save_image
 
-from degradation_dataset import create_imagenet_degradation_loader
+from dataset import create_restoration_loader
 
 
 def main():
-    loader = create_imagenet_degradation_loader(
-        split="train[:16]",
+    loader = create_restoration_loader(
+        split="train",
+        max_samples=16,
         batch_size=8,
         shuffle=False,
         num_workers=0,
@@ -22,6 +25,10 @@ def main():
 
     print("Clean shape:", clean.shape)
     print("Degraded shape:", degraded.shape)
+
+    print("Clean range:", clean.min().item(), clean.max().item())
+    print("Degraded range:", degraded.min().item(), degraded.max().item())
+
     print("Sigma:", batch["sigma"])
     print("Kernel size:", batch["kernel_size"])
     print("Theta:", batch["theta"])
@@ -32,15 +39,24 @@ def main():
 
     n = min(8, clean.shape[0])
 
-    grid = make_grid(
-        torch.cat([clean[:n], degraded[:n]], dim=0),
-        nrow=n,
-        normalize=True
+    comparison = torch.cat(
+        [
+            clean[:n],
+            degraded[:n],
+        ],
+        dim=0,
     )
 
-    save_image(grid, out_dir / "clean_vs_degraded.png")
+    grid = make_grid(
+        comparison,
+        nrow=n,
+        normalize=True,
+    )
 
-    print("Saved:", out_dir / "clean_vs_degraded.png")
+    out_file = out_dir / "comparison.png"
+    save_image(grid, out_file)
+
+    print("Saved:", out_file)
 
 
 if __name__ == "__main__":
