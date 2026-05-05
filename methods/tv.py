@@ -2,14 +2,13 @@
 
 import torch
 
-from degradation import apply_motion_blur
 
-
-def total_variation(x: torch.Tensor) -> torch.Tensor:
+def total_variation_rgb(x: torch.Tensor) -> torch.Tensor:
     """
-    Anisotropic Total Variation.
+    Anisotropic RGB Total Variation.
 
-    x shape: [B, C, H, W]
+    x shape:
+        [B, 3, H, W]
     """
     tv_h = torch.abs(x[:, :, 1:, :] - x[:, :, :-1, :]).mean()
     tv_w = torch.abs(x[:, :, :, 1:] - x[:, :, :, :-1]).mean()
@@ -19,7 +18,7 @@ def total_variation(x: torch.Tensor) -> torch.Tensor:
 
 def tv_reconstruction(
     degraded: torch.Tensor,
-    blur_kernel: torch.Tensor,
+    K,
     lambda_tv: float = 0.01,
     num_iters: int = 300,
     lr: float = 0.05,
@@ -27,22 +26,17 @@ def tv_reconstruction(
     verbose: bool = True,
 ) -> torch.Tensor:
     """
-    Reconstruct clean image from degraded observation using TV regularization.
+    RGB TV reconstruction.
 
     Minimizes:
 
-        || A(x) - y ||^2 + lambda * TV(x)
+        ||K(x) - y||^2 + lambda_tv * TV(x)
 
     where:
-        y = degraded image
-        A = motion blur operator
-        x = reconstructed image
+        y = degraded observation
+        K = RGB blur operator
+        x = reconstructed clean image
     """
-
-    device = degraded.device
-    blur_kernel = blur_kernel.to(device)
-
-    # inizializzazione: parto dall'immagine degradata
     x = degraded.clone().detach()
     x.requires_grad_(True)
 
@@ -51,13 +45,8 @@ def tv_reconstruction(
     for it in range(num_iters):
         optimizer.zero_grad()
 
-        blurred_x = torch.stack([
-            apply_motion_blur(img, blur_kernel)
-            for img in x
-        ], dim=0)
-
-        data_term = torch.mean((blurred_x - degraded) ** 2)
-        tv_term = total_variation(x)
+        data_term = torch.mean((K(x) - degraded) ** 2)
+        tv_term = total_variation_rgb(x)
 
         loss = data_term + lambda_tv * tv_term
 

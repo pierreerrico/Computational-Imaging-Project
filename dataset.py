@@ -14,21 +14,19 @@ from config import (
 )
 
 from degradation import (
-    motion_blur_kernel,
+    create_blur_operator,
     degrade_image,
 )
 
 
 class ImageNetRestorationDataset(Dataset):
     """
-    PyTorch dataset for image restoration.
+    PyTorch dataset for RGB image restoration.
 
     Each sample contains:
     - clean image x
     - degraded observation y
     - degradation parameters
-
-    The degradation is deterministic with respect to idx and seed.
     """
 
     def __init__(
@@ -52,7 +50,8 @@ class ImageNetRestorationDataset(Dataset):
             T.ToTensor(),
         ])
 
-        self.blur_kernel = motion_blur_kernel(
+        self.blur_operator = create_blur_operator(
+            image_size=image_size,
             kernel_size=motion_blur_config["kernel_size"],
             theta=motion_blur_config["theta"],
         )
@@ -72,8 +71,8 @@ class ImageNetRestorationDataset(Dataset):
 
         degraded = degrade_image(
             clean=clean,
-            kernel=self.blur_kernel,
-            sigma=sigma,
+            blur_operator=self.blur_operator,
+            noise_level=sigma,
             seed=self.seed + idx,
         )
 
@@ -93,14 +92,6 @@ def load_hf_imagenet(
     split: str = "train",
     max_samples: int | None = None,
 ):
-    """
-    Load Hugging Face ImageNet dataset.
-
-    Important:
-    use split='train', split='validation', or split='test'.
-    Do not use split='train[:16]' here if the full split has already been cached.
-    Use max_samples instead.
-    """
     hf_dataset = load_dataset(
         dataset_name,
         split=split,
