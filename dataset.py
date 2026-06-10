@@ -1,151 +1,24 @@
-# dataset.py
-
 import torch
-from torch.utils.data import Dataset, DataLoader
-import torchvision.transforms as T
+from torch.utils.data import Dataset
+from torchvision import transforms
 from datasets import load_dataset
 
-from config import (
-    DATASET_NAME,
-    IMAGE_SIZE,
-    NOISE_LEVELS,
-    MOTION_BLUR,
-    SEED,
-)
 
-from degradation import (
-    create_blur_operator,
-    degrade_image,
-)
+class ImageDataset(Dataset):
+    def __init__(self, hf_dataset, image_size=256):
+        self.hf_dataset = hf_dataset
 
-
-class ImageNetRestorationDataset(Dataset):
-    """
-    PyTorch dataset for RGB image restoration.
-
-    Each sample contains:
-    - clean image x
-    - degraded observation y
-    - degradation parameters
-    """
-
-    def __init__(
-        self,
-        hf_dataset,
-        image_size: int = IMAGE_SIZE,
-        noise_levels: list[float] = NOISE_LEVELS,
-        motion_blur_config: dict = MOTION_BLUR,
-        fixed_noise_level: float | None = None,
-        seed: int = SEED,
-    ):
-        self.dataset = hf_dataset
-        self.image_size = image_size
-        self.noise_levels = noise_levels
-        self.motion_blur_config = motion_blur_config
-        self.fixed_noise_level = fixed_noise_level
-        self.seed = seed
-
-        self.transform = T.Compose([
-            T.Resize((image_size, image_size)),
-            T.ToTensor(),
+        self.preprocess = transforms.Compose([
+            transforms.Resize((image_size, image_size)),
+            transforms.ToTensor(),
         ])
 
-        self.blur_operator = create_blur_operator(
-            image_size=image_size,
-            kernel_size=motion_blur_config["kernel_size"],
-            theta=motion_blur_config["theta"],
-        )
-
     def __len__(self):
-        return len(self.dataset)
+        return len(self.hf_dataset)
 
-    def __getitem__(self, idx: int):
-        sample = self.dataset[idx]
+    def __getitem__(self, index):
+        image = self.hf_dataset[index]["image"]
 
-        clean = self.transform(sample["image"].convert("RGB"))
+        image = image.convert("RGB")
 
-        if self.fixed_noise_level is None:
-            sigma = self.noise_levels[idx % len(self.noise_levels)]
-        else:
-            sigma = self.fixed_noise_level
-
-        degraded = degrade_image(
-            clean=clean,
-            blur_operator=self.blur_operator,
-            noise_level=sigma,
-            seed=self.seed + idx,
-        )
-
-        return {
-            "clean": clean,
-            "degraded": degraded,
-            "label": sample.get("label", -1),
-            "sigma": sigma,
-            "kernel_size": self.motion_blur_config["kernel_size"],
-            "theta": self.motion_blur_config["theta"],
-            "idx": idx,
-        }
-
-
-def load_hf_imagenet(
-    dataset_name: str = DATASET_NAME,
-    split: str = "train",
-    max_samples: int | None = None,
-):
-    hf_dataset = load_dataset(
-        dataset_name,
-        split=split,
-    )
-
-    if max_samples is not None:
-        max_samples = min(max_samples, len(hf_dataset))
-        hf_dataset = hf_dataset.select(range(max_samples))
-
-    return hf_dataset
-
-
-def create_restoration_dataset(
-    split: str = "train",
-    max_samples: int | None = None,
-    fixed_noise_level: float | None = None,
-    seed: int = SEED,
-) -> ImageNetRestorationDataset:
-    hf_dataset = load_hf_imagenet(
-        split=split,
-        max_samples=max_samples,
-    )
-
-    dataset = ImageNetRestorationDataset(
-        hf_dataset=hf_dataset,
-        fixed_noise_level=fixed_noise_level,
-        seed=seed,
-    )
-
-    return dataset
-
-
-def create_restoration_loader(
-    split: str = "train",
-    max_samples: int | None = None,
-    batch_size: int = 16,
-    shuffle: bool = True,
-    num_workers: int = 0,
-    fixed_noise_level: float | None = None,
-    seed: int = SEED,
-) -> DataLoader:
-    dataset = create_restoration_dataset(
-        split=split,
-        max_samples=max_samples,
-        fixed_noise_level=fixed_noise_level,
-        seed=seed,
-    )
-
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=num_workers,
-        pin_memory=torch.cuda.is_available(),
-    )
-
-    return loader
+        return self.preprocess(image)

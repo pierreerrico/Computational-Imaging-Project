@@ -1,72 +1,36 @@
 # degradation.py
 
+from dataclasses import dataclass, field
+import random
 import torch
 
 from IPPy.utilities import gaussian_noise
-
-from operators_rgb import RGBBlurring
-
-
-def motion_blur_kernel(kernel_size: int, theta: float) -> torch.Tensor:
-    """
-    Create a normalized 2D motion blur kernel.
-
-    theta is expressed in degrees.
-    """
-    kernel = torch.zeros((kernel_size, kernel_size), dtype=torch.float32)
-
-    center = kernel_size // 2
-    theta_rad = torch.tensor(theta * torch.pi / 180.0)
-
-    dx = torch.cos(theta_rad).item()
-    dy = torch.sin(theta_rad).item()
-
-    for i in range(kernel_size):
-        offset = i - center
-        x = int(round(center + offset * dx))
-        y = int(round(center + offset * dy))
-
-        if 0 <= x < kernel_size and 0 <= y < kernel_size:
-            kernel[y, x] = 1.0
-
-    kernel_sum = kernel.sum()
-
-    if kernel_sum == 0:
-        raise ValueError("Generated motion blur kernel is empty.")
-
-    return kernel / kernel_sum
+from IPPy import operators
 
 
-def create_blur_operator(
-    image_size: int,
-    kernel_size: int,
-    theta: float,
-) -> RGBBlurring:
-    kernel = motion_blur_kernel(
-        kernel_size=kernel_size,
-        theta=theta,
-    )
+@dataclass
+class DegradationParameters:
+    image_size: int = 256
+    kernel_type: str = "motion"
+    kernel_size: int = 9
+    motion_angle: float = 45.0
+    noise_levels: list[float] = field(default_factory=lambda: [0.005, 0.01, 0.05, 0.1])
 
-    return RGBBlurring(
-        img_shape=(image_size, image_size),
-        kernel=kernel,
+
+def create_blur_operator(params: DegradationParameters):
+    return operators.Blurring(
+        img_shape=(params.image_size, params.image_size),
+        kernel_type=params.kernel_type,
+        kernel_size=params.kernel_size,
+        motion_angle=params.motion_angle,
     )
 
 
-def add_relative_gaussian_noise(
+def add_noise(
     y: torch.Tensor,
     noise_level: float,
     seed: int | None = None,
 ) -> torch.Tensor:
-    """
-    Add IPPy-style relative Gaussian noise.
-
-    IPPy gaussian_noise returns noise e such that:
-
-        ||e|| = noise_level * ||y||
-
-    We then return clamp(y + e, 0, 1).
-    """
     if seed is not None:
         torch.manual_seed(seed)
 
@@ -74,33 +38,61 @@ def add_relative_gaussian_noise(
     return torch.clamp(y + noise, 0.0, 1.0)
 
 
-def degrade_image(
-    clean: torch.Tensor,
-    blur_operator: RGBBlurring,
-    noise_level: float,
-    seed: int | None = None,
-) -> torch.Tensor:
-    """
-    Apply:
+class ImageDegradation:
+    def __init__(
+        self,
+        params: DegradationParameters | None = None,
+    ):
+        self.params = params or DegradationParameters()
+        self.operator = create_blur_operator(self.params)
 
-        clean -> motion blur -> Gaussian noise
+    @torch.no_grad()
+    def __call__(
+        self,
+        image: torch.Tensor,
+    ) -> torch.Tensor:
 
-    clean shape:
-        [3, H, W]
+        if image.ndim == 3:
+            image = image.unsqueeze(0)
 
-    output shape:
-        [3, H, W]
-    """
-    if clean.ndim != 3:
-        raise ValueError(f"Expected clean image [C, H, W], got {clean.shape}")
+        if image.ndim != 4:
+            raise ValueError(
+                f"Expected image with shape [3,H,W] or [B,3,H,W], got {image.shape}"
+            )
 
-    clean_batch = clean.unsqueeze(0)
+        if image.shape[1] != 3:
+            raise ValueError(
+                f"Expected RGB image with 3 channels, got {image.shape[1]} channels"
+            )
 
-    blurred = blur_operator(clean_batch)
-    degraded = add_relative_gaussian_noise(
-        blurred,
-        noise_level=noise_level,
-        seed=seed,
-    )
+        if image.shape[-2:] != (
+            self.params.image_size,
+            self.params.image_size,
+        ):
+            raise ValueError(
+                f"Expected image size {self.params.image_size}x"
+                f"{self.params.image_size}, got {image.shape[-2:]}"
+            )
 
-    return degraded.squeeze(0)
+        clean = image.float().clamp(0.0, 1.0)
+
+        channels = [
+            clean[:, i:i + 1, :, :]
+            for i in range(3)
+        ]
+
+        blurred = torch.cat(
+            [
+                self.operator(channel)
+                for channel in channels
+            ],
+            dim=1,
+        )
+
+        noise_level = random.choice(self.params.noise_levels)
+        degraded = add_noise(
+            blurred,
+            noise_level=noise_level,
+        )
+
+        return degraded
