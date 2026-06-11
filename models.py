@@ -408,7 +408,7 @@ class NAFNetModel:
         train_dataset: Dataset | None = None,
         validation_dataset: Dataset | None = None,
         train_degradation: ImageDegradation | None = None,
-        validation_degradation: ImageDegradation | None = None,
+        validation_degradations: list[ImageDegradation] | None = None,
         batch_size: int = 32,
         learning_rate: float = 1e-4,
         checkpoint_path: str = "./weights/NAFNet/NAF_checkpoint.pth",
@@ -483,12 +483,13 @@ class NAFNetModel:
         if train_degradation is None:
             train_degradation = ImageDegradation()
         
-        if validation_degradation is None:
-            validation_degradation = ImageDegradation(
-                DegradationParameters(
-                    noise_levels=[0.05]
-                )
-            )
+        if validation_degradations is None:
+            validation_degradations = [
+                ImageDegradation(DegradationParameters(noise_levels=[0.005])),
+                ImageDegradation(DegradationParameters(noise_levels=[0.01])),
+                ImageDegradation(DegradationParameters(noise_levels=[0.05])),
+                ImageDegradation(DegradationParameters(noise_levels=[0.1])),
+                ]
 
         os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
 
@@ -515,7 +516,7 @@ class NAFNetModel:
             optimizer,
             mode="min",
             factor=0.5,
-            patience=5,
+            patience=3,
             min_lr=1e-6,
         )
 
@@ -625,34 +626,36 @@ class NAFNetModel:
             validation_ssim_values = []
 
             with torch.no_grad():
-                for clean in validation_loader:
-                    clean = clean.to(device, non_blocking=True)
-                    degraded = validation_degradation(clean)
+                for validation_degradation in validation_degradations:
+                    for clean in validation_loader:
+                        clean = clean.to(device, non_blocking=True)
+                        degraded = validation_degradation(clean)
 
-                    with torch.amp.autocast( # type: ignore
-                        "cuda",
-                        enabled=use_amp,
-                    ):
-                        pred = self.model(degraded)
-                        pred = pred.clamp(0.0, 1.0)
-                        val_loss = (
-                            loss_mae(pred, clean)
-                            + 0.05 * loss_fourier(pred, clean)
-                            + 0.2 * (1.0 - SSIM(pred, clean))
-                        )
+                        with torch.amp.autocast(  # type: ignore
+                            "cuda",
+                            enabled=use_amp,
+                        ):
+                            pred = self.model(degraded)
+                            pred = pred.clamp(0.0, 1.0)
 
-                    psnr_value = PSNR(pred.float(), clean.float())
-                    ssim_value = SSIM(pred.float(), clean.float())
+                            val_loss = (
+                                loss_mae(pred, clean)
+                                + 0.05 * loss_fourier(pred, clean)
+                                + 0.2 * (1.0 - SSIM(pred, clean))
+                            )
 
-                    if isinstance(psnr_value, torch.Tensor):
-                        psnr_value = psnr_value.item()
+                            psnr_value = PSNR(pred.float(), clean.float())
+                            ssim_value = SSIM(pred.float(), clean.float())
 
-                    if isinstance(ssim_value, torch.Tensor):
-                        ssim_value = ssim_value.item()
+                            if isinstance(psnr_value, torch.Tensor):
+                                psnr_value = psnr_value.item()
 
-                    validation_losses.append(val_loss.item())
-                    validation_psnr_values.append(psnr_value)
-                    validation_ssim_values.append(ssim_value)
+                            if isinstance(ssim_value, torch.Tensor):
+                                ssim_value = ssim_value.item()
+
+                            validation_losses.append(val_loss.item())
+                            validation_psnr_values.append(psnr_value)
+                            validation_ssim_values.append(ssim_value)
 
             mean_validation_loss = sum(validation_losses) / len(validation_losses)
             mean_validation_psnr = sum(validation_psnr_values) / len(validation_psnr_values)
@@ -687,7 +690,7 @@ class NAFNetModel:
                 preview_clean = preview_clean[:preview_n].to(device, non_blocking=True)
 
                 with torch.no_grad():
-                    preview_degraded = validation_degradation(preview_clean)
+                    preview_degraded = validation_degradations[0](preview_clean)
 
                     with torch.amp.autocast(  # type: ignore
                         "cuda",
@@ -1173,9 +1176,6 @@ class GAN:
             batch_size=batch_size,
             shuffle=True,
             drop_last=True,
-            num_workers=2,
-            pin_memory=use_amp,
-            persistent_workers=True,
         )
 
         @torch.no_grad()
@@ -1347,7 +1347,7 @@ class GAN:
                     with torch.amp.autocast("cuda", enabled=use_amp):  # type: ignore
                         preview_images = G_ema(z)
 
-                    preview_images = preview_images.detach().cpu().clamp(0, 1)
+                    preview_images = preview_images.detach().cpu().float().clamp(0, 1)
 
                 plot(
                     *preview_images,
@@ -1382,3 +1382,4 @@ class GAN:
         torch.save(self.C.state_dict(), c_path)
 
         return g_history, c_history
+    

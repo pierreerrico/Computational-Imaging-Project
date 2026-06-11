@@ -11,13 +11,18 @@ from IPPy import operators
 @dataclass
 class DegradationParameters:
     image_size: int = 256
-    kernel_type: str = "motion"
+    kernel_type: str | None = "motion"
     kernel_size: int = 9
     motion_angle: float = 45.0
-    noise_levels: list[float] = field(default_factory=lambda: [0.005, 0.01, 0.05, 0.1])
+    noise_levels: list[float] = field(
+        default_factory=lambda: [0.005, 0.01, 0.05, 0.1]
+    )
 
 
 def create_blur_operator(params: DegradationParameters):
+    if params.kernel_type is None:
+        return None
+
     return operators.Blurring(
         img_shape=(params.image_size, params.image_size),
         kernel_type=params.kernel_type,
@@ -42,7 +47,7 @@ class ImageDegradation:
     def __init__(
         self,
         params: DegradationParameters | None = None,
-    ):
+    ) -> None:
         self.params = params or DegradationParameters()
         self.operator = create_blur_operator(self.params)
 
@@ -76,20 +81,24 @@ class ImageDegradation:
 
         clean = image.float().clamp(0.0, 1.0)
 
-        channels = [
-            clean[:, i:i + 1, :, :]
-            for i in range(3)
-        ]
+        if self.operator is None:
+            blurred = clean
+        else:
+            channels = [
+                clean[:, i:i + 1, :, :]
+                for i in range(3)
+            ]
 
-        blurred = torch.cat(
-            [
-                self.operator(channel)
-                for channel in channels
-            ],
-            dim=1,
-        )
+            blurred = torch.cat(
+                [
+                    self.operator(channel)
+                    for channel in channels
+                ],
+                dim=1,
+            )
 
         noise_level = random.choice(self.params.noise_levels)
+
         degraded = add_noise(
             blurred,
             noise_level=noise_level,
