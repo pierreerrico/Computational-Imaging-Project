@@ -1389,25 +1389,55 @@ class HQSLayer(nn.Module):
         self,
         K,
         denoiser: NAFNet,
-        cg_iters: int = 10,
-        initial_mu: float = 1.0,
+        initial_mu: float = 0.1,
+        cg_iters: int = 5,
         freeze_denoiser: bool = True,
     ) -> None:
         super().__init__()
+
+        if cg_iters <= 0:
+            raise ValueError("cg_iters must be greater than 0.")
 
         self.K = K
         self.denoiser = denoiser
         self.cg_iters = cg_iters
         self.freeze_denoiser = freeze_denoiser
 
-        theta_init = torch.log(torch.expm1(torch.tensor(initial_mu)))
-        self.theta = nn.Parameter(theta_init)
+        self.raw_mu = nn.Parameter(
+            torch.log(torch.expm1(torch.tensor(initial_mu)))
+        )
 
     def get_mu(self) -> torch.Tensor:
-        return F.softplus(self.theta) + 1e-6
+        return F.softplus(self.raw_mu) + 1e-8
 
-    def A(self, x: torch.Tensor, mu: torch.Tensor) -> torch.Tensor:
-        return self.K.T(self.K(x)) + mu * x
+    def batch_dot(
+        self,
+        a: torch.Tensor,
+        b: torch.Tensor,
+    ) -> torch.Tensor:
+        return torch.sum(a * b, dim=(1, 2, 3), keepdim=True)
+
+    def apply_A(
+        self,
+        x: torch.Tensor,
+        mu: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Applies:
+
+            A(x) = K^T K x + mu x
+
+        K and K.T are forced to float32 because the underlying blur operator
+        does not support AMP float16 kernels.
+        """
+
+        with torch.amp.autocast("cuda", enabled=False): # type: ignore
+            x32 = x.float()
+            mu32 = mu.float()
+
+            result32 = self.K.T(self.K(x32)) + mu32 * x32
+
+        return result32
 
     def conjugate_gradient(
         self,
@@ -1415,28 +1445,41 @@ class HQSLayer(nn.Module):
         x0: torch.Tensor,
         mu: torch.Tensor,
     ) -> torch.Tensor:
-        x = x0.clone()
+        """
+        Solves approximately:
 
-        r = b - self.A(x, mu)
-        p = r.clone()
-        rs_old = torch.sum(r * r)
+            (K^T K + mu I)x = b
 
-        for _ in range(self.cg_iters):
-            Ap = self.A(p, mu)
+        using fixed-iteration conjugate gradient.
+        CG is kept in float32 for numerical stability.
+        """
 
-            alpha = rs_old / (torch.sum(p * Ap) + 1e-8)
+        with torch.amp.autocast("cuda", enabled=False): # type: ignore
+            x = x0.float()
+            b = b.float()
+            mu = mu.float()
 
-            x = x + alpha * p
-            r = r - alpha * Ap
+            r = b - self.apply_A(x, mu)
+            p = r
 
-            rs_new = torch.sum(r * r)
+            rs_old = self.batch_dot(r, r)
 
-            if torch.sqrt(rs_new) < 1e-6:
-                break
+            eps = 1e-8
 
-            beta = rs_new / (rs_old + 1e-8)
-            p = r + beta * p
-            rs_old = rs_new
+            for _ in range(self.cg_iters):
+                Ap = self.apply_A(p, mu)
+
+                alpha = rs_old / (self.batch_dot(p, Ap) + eps)
+
+                x = x + alpha * p
+                r = r - alpha * Ap
+
+                rs_new = self.batch_dot(r, r)
+
+                beta = rs_new / (rs_old + eps)
+                p = r + beta * p
+
+                rs_old = rs_new
 
         return x
 
@@ -1446,6 +1489,8 @@ class HQSLayer(nn.Module):
         x: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
 
+        original_dtype = x.dtype
+
         if self.freeze_denoiser:
             with torch.no_grad():
                 z = self.denoiser(x).clamp(0.0, 1.0)
@@ -1453,15 +1498,23 @@ class HQSLayer(nn.Module):
             z = self.denoiser(x).clamp(0.0, 1.0)
 
         mu = self.get_mu()
-        b = self.K.T(y_delta) + mu * z
+
+        with torch.amp.autocast("cuda", enabled=False): # type: ignore
+            y32 = y_delta.float()
+            z32 = z.float()
+            mu32 = mu.float()
+
+            b = self.K.T(y32) + mu32 * z32
 
         x = self.conjugate_gradient(
             b=b,
-            x0=z,
+            x0=x.float(),
             mu=mu,
         )
 
-        return x, z
+        x = x.clamp(0.0, 1.0)
+
+        return x.to(dtype=original_dtype), z
 
 class HQSNet(nn.Module):
     def __init__(
@@ -1470,8 +1523,8 @@ class HQSNet(nn.Module):
         denoiser: NAFNet,
         checkpoint_path: str = "./weights/NAFNet/NAFImgDenoise.pth",
         n_layers: int = 10,
-        cg_iters: int = 10,
-        initial_mu: float = 1.0,
+        cg_iters: int = 5,
+        initial_mu: float = 0.1,
         device: torch.device | str = "cuda" if torch.cuda.is_available() else "cpu",
     ) -> None:
         super().__init__()
@@ -1527,7 +1580,8 @@ class HQSNet(nn.Module):
         return_intermediates: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, dict[str, list[torch.Tensor]]]:
 
-        y_delta = y_delta.to(self.device)
+        device = next(self.parameters()).device
+        y_delta = y_delta.to(device)
 
         x = self.initial_reconstruction(y_delta)
 
@@ -1639,7 +1693,7 @@ class HQSNetModel:
             min_lr=1e-6,
         )
 
-        use_amp = device.type == False
+        use_amp = device.type == "cuda"
 
         scaler = torch.amp.GradScaler( # type: ignore
             "cuda",
@@ -1831,9 +1885,9 @@ class HQSNetModel:
                         preview_pred = self.model(preview_degraded)
                         preview_pred = preview_pred.clamp(0.0, 1.0)
 
-                preview_clean = preview_clean.detach().cpu()
-                preview_degraded = preview_degraded.detach().cpu()
-                preview_pred = preview_pred.detach().cpu()
+                preview_clean = preview_clean.detach().float().cpu()
+                preview_degraded = preview_degraded.detach().float().cpu()
+                preview_pred = preview_pred.detach().float().cpu()
 
                 images = []
                 titles = []
