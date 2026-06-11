@@ -1,0 +1,58 @@
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# =========================
+# Virtual environments
+# =========================
+.venv/
+venv/
+env/
+
+# =========================
+# Jupyter
+# =========================
+.ipynb_checkpoints/
+
+# =========================
+# PyTorch checkpoints
+# =========================
+*.pth
+*.pt
+*.ckpt
+
+# =========================
+# Model weights and training outputs
+# =========================
+weights/
+checkpoints/
+runs/
+logs/
+outputs/
+results/
+
+# =========================
+# Datasets
+# =========================
+data/
+datasets/
+cache/
+
+# Hugging Face datasets cache
+.huggingface/
+.cache/
+
+# =========================
+# Images and generated files
+# =========================
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.tiff

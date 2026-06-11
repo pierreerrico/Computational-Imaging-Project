@@ -15,6 +15,7 @@ from copy import deepcopy
 from degradation import DegradationParameters, ImageDegradation
 from focal_frequency_loss import FocalFrequencyLoss
 from utils import plot # type: ignore
+from typing import Any, Mapping, cast
 
 class TotalVariationRegularizer:
     """
@@ -1382,4 +1383,514 @@ class GAN:
         torch.save(self.C.state_dict(), c_path)
 
         return g_history, c_history
+
+class HQSLayer(nn.Module):
+    def __init__(
+        self,
+        K,
+        denoiser: NAFNet,
+        cg_iters: int = 10,
+        initial_mu: float = 1.0,
+        freeze_denoiser: bool = True,
+    ) -> None:
+        super().__init__()
+
+        self.K = K
+        self.denoiser = denoiser
+        self.cg_iters = cg_iters
+        self.freeze_denoiser = freeze_denoiser
+
+        theta_init = torch.log(torch.expm1(torch.tensor(initial_mu)))
+        self.theta = nn.Parameter(theta_init)
+
+    def get_mu(self) -> torch.Tensor:
+        return F.softplus(self.theta) + 1e-6
+
+    def A(self, x: torch.Tensor, mu: torch.Tensor) -> torch.Tensor:
+        return self.K.T(self.K(x)) + mu * x
+
+    def conjugate_gradient(
+        self,
+        b: torch.Tensor,
+        x0: torch.Tensor,
+        mu: torch.Tensor,
+    ) -> torch.Tensor:
+        x = x0.clone()
+
+        r = b - self.A(x, mu)
+        p = r.clone()
+        rs_old = torch.sum(r * r)
+
+        for _ in range(self.cg_iters):
+            Ap = self.A(p, mu)
+
+            alpha = rs_old / (torch.sum(p * Ap) + 1e-8)
+
+            x = x + alpha * p
+            r = r - alpha * Ap
+
+            rs_new = torch.sum(r * r)
+
+            if torch.sqrt(rs_new) < 1e-6:
+                break
+
+            beta = rs_new / (rs_old + 1e-8)
+            p = r + beta * p
+            rs_old = rs_new
+
+        return x
+
+    def forward(
+        self,
+        y_delta: torch.Tensor,
+        x: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+
+        if self.freeze_denoiser:
+            with torch.no_grad():
+                z = self.denoiser(x).clamp(0.0, 1.0)
+        else:
+            z = self.denoiser(x).clamp(0.0, 1.0)
+
+        mu = self.get_mu()
+        b = self.K.T(y_delta) + mu * z
+
+        x = self.conjugate_gradient(
+            b=b,
+            x0=z,
+            mu=mu,
+        )
+
+        return x, z
+
+class HQSNet(nn.Module):
+    def __init__(
+        self,
+        K,
+        denoiser: NAFNet,
+        checkpoint_path: str = "./weights/NAFNet/NAFImgDenoise.pth",
+        n_layers: int = 10,
+        cg_iters: int = 10,
+        initial_mu: float = 1.0,
+        device: torch.device | str = "cuda" if torch.cuda.is_available() else "cpu",
+    ) -> None:
+        super().__init__()
+
+        if n_layers <= 0:
+            raise ValueError("n_layers must be greater than 0.")
+
+        self.K = K
+        self.device = torch.device(device)
+
+        checkpoint = torch.load(
+            checkpoint_path,
+            map_location=self.device,
+            weights_only=False,
+        )
+
+        if not isinstance(checkpoint, dict):
+            raise TypeError("The loaded checkpoint must be a dictionary.")
+
+        state_dict = cast(Mapping[str, Any], checkpoint["model"])
+
+        denoiser.load_state_dict(state_dict)
+        denoiser.to(self.device)
+        denoiser.eval()
+
+        for p in denoiser.parameters():
+            p.requires_grad = False
+
+        self.denoiser = denoiser
+
+        self.layers = nn.ModuleList(
+            [
+                HQSLayer(
+                    K=K,
+                    denoiser=self.denoiser,
+                    cg_iters=cg_iters,
+                    initial_mu=initial_mu,
+                    freeze_denoiser=True,
+                )
+                for _ in range(n_layers)
+            ]
+        )
+
+    def initial_reconstruction(
+        self,
+        y_delta: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.K.T(y_delta).clamp(0.0, 1.0)
+
+    def forward(
+        self,
+        y_delta: torch.Tensor,
+        return_intermediates: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, dict[str, list[torch.Tensor]]]:
+
+        y_delta = y_delta.to(self.device)
+
+        x = self.initial_reconstruction(y_delta)
+
+        intermediates: dict[str, list[torch.Tensor]] = {
+            "x": [],
+            "z": [],
+            "mu": [],
+        }
+
+        for layer in self.layers:
+            hqs_layer = cast(HQSLayer, layer)
+
+            x, z = hqs_layer(y_delta, x)
+
+            if return_intermediates:
+                intermediates["x"].append(x)
+                intermediates["z"].append(z)
+                intermediates["mu"].append(hqs_layer.get_mu())
+
+        x = x.clamp(0.0, 1.0)
+
+        if return_intermediates:
+            return x, intermediates
+
+        return x
     
+class HQSNetModel:
+    """
+    Training wrapper for an unrolled HQS restoration network.
+
+    The model uses a frozen pretrained NAFNet as denoising prior and learns
+    the HQS parameters, mainly one mu per unrolled layer.
+
+    Training pipeline:
+
+        clean image -> degradation -> degraded image -> HQSNet -> restored image
+    """
+
+    def __init__(self, model: HQSNet) -> None:
+        self.model = model
+
+    def train_model(
+        self,
+        n_epochs: int = 50,
+        train_dataset: Dataset | None = None,
+        validation_dataset: Dataset | None = None,
+        train_degradation: ImageDegradation | None = None,
+        validation_degradations: list[ImageDegradation] | None = None,
+        batch_size: int = 16,
+        learning_rate: float = 1e-3,
+        checkpoint_path: str = "./weights/HQSNet/HQS_checkpoint.pth",
+        resume: bool = True,
+        preview_every: int | None = 5,
+        preview_n: int | None = 4,
+        device: torch.device | str = "cuda" if torch.cuda.is_available() else "cpu",
+    ) -> dict[str, list[float]]:
+
+        device = torch.device(device)
+        self.model.to(device)
+
+        if train_dataset is None:
+            raise ValueError("Training dataset must be defined.")
+
+        if validation_dataset is None:
+            raise ValueError("Validation dataset must be defined.")
+
+        if train_degradation is None:
+            train_degradation = ImageDegradation()
+
+        if validation_degradations is None:
+            validation_degradations = [
+                ImageDegradation(DegradationParameters(noise_levels=[0.005])),
+                ImageDegradation(DegradationParameters(noise_levels=[0.01])),
+                ImageDegradation(DegradationParameters(noise_levels=[0.05])),
+                ImageDegradation(DegradationParameters(noise_levels=[0.1])),
+            ]
+
+        os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
+
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            drop_last=True,
+        )
+
+        validation_loader = DataLoader(
+            validation_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+        )
+
+        trainable_params = [
+            p for p in self.model.parameters()
+            if p.requires_grad
+        ]
+
+        optimizer = torch.optim.AdamW(
+            trainable_params,
+            lr=learning_rate,
+            weight_decay=0.0,
+        )
+
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=0.5,
+            patience=3,
+            min_lr=1e-6,
+        )
+
+        use_amp = device.type == False
+
+        scaler = torch.amp.GradScaler( # type: ignore
+            "cuda",
+            enabled=use_amp,
+        )
+
+        history: dict[str, list[float]] = {
+            "train_loss": [],
+            "validation_loss": [],
+            "validation_psnr": [],
+            "validation_ssim": [],
+            "learning_rate": [],
+        }
+
+        loss_mae = nn.L1Loss()
+        loss_fourier = FocalFrequencyLoss()
+
+        best_validation_loss = float("inf")
+        start_epoch = 0
+
+        if resume and os.path.exists(checkpoint_path):
+            checkpoint = torch.load(
+                checkpoint_path,
+                map_location=device,
+                weights_only=False,
+            )
+
+            if not isinstance(checkpoint, dict):
+                raise TypeError("The loaded checkpoint must be a dictionary.")
+
+            self.model.load_state_dict(checkpoint["model"])
+            optimizer.load_state_dict(checkpoint["optimizer"])
+
+            if "scheduler" in checkpoint:
+                scheduler.load_state_dict(checkpoint["scheduler"])
+
+            if "scaler" in checkpoint:
+                scaler.load_state_dict(checkpoint["scaler"])
+
+            history = checkpoint["history"]
+            history.setdefault("learning_rate", [])
+
+            best_validation_loss = checkpoint["best_validation_loss"]
+            start_epoch = checkpoint["epoch"] + 1
+
+            print(f"Resumed HQSNet training from epoch {start_epoch}")
+
+        for epoch in range(start_epoch, n_epochs):
+            self.model.train()
+
+            # Keep frozen NAFNet in eval mode even when HQSNet is in train mode.
+            self.model.denoiser.eval()
+
+            train_losses = []
+
+            progress_bar = tqdm(
+                train_loader,
+                desc=f"HQS epoch {epoch + 1}/{n_epochs}",
+                leave=True,
+            )
+
+            for clean in progress_bar:
+                clean = clean.to(device, non_blocking=True)
+                degraded = train_degradation(clean).to(device)
+
+                optimizer.zero_grad(set_to_none=True)
+
+                with torch.amp.autocast( # type: ignore
+                    "cuda",
+                    enabled=use_amp,
+                ):
+                    pred = self.model(degraded)
+                    pred = pred.clamp(0.0, 1.0)
+
+                    loss = (
+                        loss_mae(pred, clean)
+                        + 0.05 * loss_fourier(pred, clean)
+                        + 0.2 * (1.0 - SSIM(pred, clean))
+                    )
+
+                scaler.scale(loss).backward()
+
+                scaler.unscale_(optimizer)
+
+                torch.nn.utils.clip_grad_norm_(
+                    trainable_params,
+                    max_norm=1.0,
+                )
+
+                scaler.step(optimizer)
+                scaler.update()
+
+                train_losses.append(loss.item())
+
+                avg_loss = sum(train_losses) / len(train_losses)
+                current_lr = optimizer.param_groups[0]["lr"]
+
+                progress_bar.set_postfix(
+                    batch_loss=f"{loss.item():.6f}",
+                    avg_loss=f"{avg_loss:.6f}",
+                    lr=f"{current_lr:.2e}",
+                )
+
+            mean_train_loss = sum(train_losses) / len(train_losses)
+            history["train_loss"].append(mean_train_loss)
+
+            self.model.eval()
+
+            validation_losses = []
+            validation_psnr_values = []
+            validation_ssim_values = []
+
+            with torch.no_grad():
+                for validation_degradation in validation_degradations:
+                    for clean in validation_loader:
+                        clean = clean.to(device, non_blocking=True)
+                        degraded = validation_degradation(clean).to(device)
+
+                        with torch.amp.autocast( # type: ignore
+                            "cuda",
+                            enabled=use_amp,
+                        ):
+                            pred = self.model(degraded)
+                            pred = pred.clamp(0.0, 1.0)
+
+                            val_loss = (
+                                loss_mae(pred, clean)
+                                + 0.05 * loss_fourier(pred, clean)
+                                + 0.2 * (1.0 - SSIM(pred, clean))
+                            )
+
+                            psnr_value = PSNR(pred.float(), clean.float())
+                            ssim_value = SSIM(pred.float(), clean.float())
+
+                            if isinstance(psnr_value, torch.Tensor):
+                                psnr_value = psnr_value.item()
+
+                            if isinstance(ssim_value, torch.Tensor):
+                                ssim_value = ssim_value.item()
+
+                            validation_losses.append(val_loss.item())
+                            validation_psnr_values.append(psnr_value)
+                            validation_ssim_values.append(ssim_value)
+
+            mean_validation_loss = sum(validation_losses) / len(validation_losses)
+            mean_validation_psnr = sum(validation_psnr_values) / len(validation_psnr_values)
+            mean_validation_ssim = sum(validation_ssim_values) / len(validation_ssim_values)
+
+            scheduler.step(mean_validation_loss)
+
+            current_lr = optimizer.param_groups[0]["lr"]
+
+            history["validation_loss"].append(mean_validation_loss)
+            history["validation_psnr"].append(mean_validation_psnr)
+            history["validation_ssim"].append(mean_validation_ssim)
+            history["learning_rate"].append(current_lr)
+
+            mus = [
+                layer.get_mu().detach().item()
+                for layer in self.model.layers
+                if isinstance(layer, HQSLayer)
+            ]
+
+            print(
+                f"HQS epoch {epoch + 1}/{n_epochs} | "
+                f"train_loss: {mean_train_loss:.6f} | "
+                f"val_loss: {mean_validation_loss:.6f} | "
+                f"val_PSNR: {mean_validation_psnr:.4f} | "
+                f"val_SSIM: {mean_validation_ssim:.4f} | "
+                f"lr: {current_lr:.2e} | "
+                f"mu: {[round(m, 4) for m in mus]}"
+            )
+
+            if (
+                preview_every is not None
+                and preview_n is not None
+                and (epoch + 1) % preview_every == 0
+            ):
+                preview_clean = next(iter(validation_loader))
+                preview_clean = preview_clean[:preview_n].to(device, non_blocking=True)
+
+                with torch.no_grad():
+                    preview_degraded = validation_degradations[0](preview_clean)
+
+                    with torch.amp.autocast( # type: ignore
+                        "cuda",
+                        enabled=use_amp,
+                    ):
+                        preview_pred = self.model(preview_degraded)
+                        preview_pred = preview_pred.clamp(0.0, 1.0)
+
+                preview_clean = preview_clean.detach().cpu()
+                preview_degraded = preview_degraded.detach().cpu()
+                preview_pred = preview_pred.detach().cpu()
+
+                images = []
+                titles = []
+
+                for i in range(preview_clean.shape[0]):
+                    images.extend(
+                        [
+                            preview_clean[i],
+                            preview_degraded[i],
+                            preview_pred[i],
+                        ]
+                    )
+
+                    titles.extend(
+                        [
+                            f"Clean {i + 1}",
+                            f"Degraded {i + 1}",
+                            f"HQS restored {i + 1}",
+                        ]
+                    )
+
+                plot(
+                    *images,
+                    titles=titles,
+                )
+
+            if mean_validation_loss < best_validation_loss:
+                best_validation_loss = mean_validation_loss
+
+                best_path = checkpoint_path.replace(".pth", "_best.pth")
+
+                torch.save(
+                    {
+                        "epoch": epoch,
+                        "model": self.model.state_dict(),
+                        "optimizer": optimizer.state_dict(),
+                        "scheduler": scheduler.state_dict(),
+                        "scaler": scaler.state_dict(),
+                        "history": history,
+                        "best_validation_loss": best_validation_loss,
+                    },
+                    best_path,
+                )
+
+                print(f"Saved best HQSNet checkpoint to: {best_path}")
+
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model": self.model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict(),
+                    "scaler": scaler.state_dict(),
+                    "history": history,
+                    "best_validation_loss": best_validation_loss,
+                },
+                checkpoint_path,
+            )
+
+        return history

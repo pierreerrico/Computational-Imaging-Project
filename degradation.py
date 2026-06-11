@@ -42,6 +42,32 @@ def add_noise(
     noise = gaussian_noise(y, noise_level)
     return torch.clamp(y + noise, 0.0, 1.0)
 
+class RGBBlurOperator:
+    def __init__(self, K):
+        self.K = K
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 4:
+            raise ValueError(f"Expected [B,C,H,W], got {x.shape}")
+
+        channels = [
+            self.K(x[:, i:i + 1, :, :])
+            for i in range(x.shape[1])
+        ]
+
+        return torch.cat(channels, dim=1)
+
+    def T(self, y: torch.Tensor) -> torch.Tensor:
+        if y.ndim != 4:
+            raise ValueError(f"Expected [B,C,H,W], got {y.shape}")
+
+        channels = [
+            self.K.T(y[:, i:i + 1, :, :])
+            for i in range(y.shape[1])
+        ]
+
+        return torch.cat(channels, dim=1)
+
 
 class ImageDegradation:
     def __init__(
