@@ -30,11 +30,12 @@ class TotalVariationRegularizer:
     max_iters : int
         Maximum number of iterations for each reconstruction.
     """
+
     def __init__(
         self,
         lambda_values: list[float] | None = None,
         max_iters: int = 100,
-    ):
+    ) -> None:
         self.lambda_values = lambda_values or [
             1e-4,
             3e-4,
@@ -47,7 +48,7 @@ class TotalVariationRegularizer:
         ]
         self.max_iters = max_iters
 
-    def reconstruct(
+    def __call__(
         self,
         y_d: torch.Tensor,
         K: op.Operator,
@@ -70,36 +71,23 @@ class TotalVariationRegularizer:
             Ground-truth image used only for computing
             PSNR, SSIM and RE. If None, no metrics are computed.
 
+        save_dir : str | None, optional
+            Directory where reconstruction files are saved.
+
+        preview : bool
+            If True, plot degraded image, reconstruction and ground truth.
+
         Returns
         -------
         list[dict]
             One result dictionary for each λ value.
-
-            Each dictionary contains:
-                - lambda
-                - reconstruction
-                - infos
-
-            If x_gt is provided, it also contains:
-                - psnr
-                - ssim
-                - re
-        -------
-        Example
-        -------
-        >>> tv = TotalVariationRegularizer()
-
-        >>> results = tv.reconstruct(
-        ...     y_d=y,
-        ...     K=blur_operator,
-        ...     x_gt=x,
-        ... )
-
-        >>> best = max(results, key=lambda r: r["psnr"])
         """
-        solver = sol.ChambollePockTpVUnconstrained(K)
 
-        results = []
+        # IPPy operators are safer on CPU.
+        y_d = y_d.detach().cpu()
+
+        if x_gt is not None:
+            x_gt = x_gt.detach().cpu()
 
         if y_d.ndim != 4:
             raise ValueError(f"Expected y_d with shape [B,C,H,W], got {y_d.shape}")
@@ -108,9 +96,13 @@ class TotalVariationRegularizer:
             raise ValueError(
                 f"x_gt and y_d must have the same shape, got {x_gt.shape} and {y_d.shape}"
             )
-        
+
         if save_dir is not None:
             os.makedirs(save_dir, exist_ok=True)
+
+        solver = sol.ChambollePockTpVUnconstrained(K)
+
+        results = []
 
         for lambda_value in self.lambda_values:
             print(f"Running TV reconstruction with lambda = {lambda_value:.1e}")
@@ -119,11 +111,10 @@ class TotalVariationRegularizer:
             infos = []
 
             for c in range(y_d.shape[1]):
-
-                y_d_c = y_d[:, c:c+1, :, :].detach()
+                y_d_c = y_d[:, c:c + 1, :, :].detach()
 
                 x_gt_c = (
-                    x_gt[:, c:c+1, :, :].detach()
+                    x_gt[:, c:c + 1, :, :].detach()
                     if x_gt is not None
                     else None
                 )
@@ -153,11 +144,9 @@ class TotalVariationRegularizer:
             lambda_name = f"{lambda_value:.0e}".replace("-", "m")
 
             if x_gt is not None:
-                x_gt_for_metrics = x_gt.detach().to(x_hat.device)
-
-                result["psnr"] = PSNR(x_hat, x_gt_for_metrics)
-                result["ssim"] = SSIM(x_hat, x_gt_for_metrics)
-                result["re"] = RE(x_hat, x_gt_for_metrics)
+                result["psnr"] = PSNR(x_hat, x_gt)
+                result["ssim"] = SSIM(x_hat, x_gt)
+                result["re"] = RE(x_hat, x_gt)
 
                 print(
                     f"Done | "
@@ -372,7 +361,7 @@ class NAFNet(nn.Module):
 
         return residual + x
 
-class NAFNetModel:
+class NAFNetTrainer:
     """
     Training wrapper for a NAFNet image restoration model.
 
@@ -1384,31 +1373,9 @@ class GAN:
 
         return g_history, c_history
 
-class HQSLayer(nn.Module):
-    def __init__(
-        self,
-        K,
-        denoiser: NAFNet,
-        initial_mu: float = 0.1,
-        cg_iters: int = 5,
-        freeze_denoiser: bool = True,
-    ) -> None:
-        super().__init__()
-
-        if cg_iters <= 0:
-            raise ValueError("cg_iters must be greater than 0.")
-
+class HQSCG:
+    def __init__(self, K: op.Operator):
         self.K = K
-        self.denoiser = denoiser
-        self.cg_iters = cg_iters
-        self.freeze_denoiser = freeze_denoiser
-
-        self.raw_mu = nn.Parameter(
-            torch.log(torch.expm1(torch.tensor(initial_mu)))
-        )
-
-    def get_mu(self) -> torch.Tensor:
-        return F.softplus(self.raw_mu) + 1e-8
 
     def batch_dot(
         self,
@@ -1417,71 +1384,88 @@ class HQSLayer(nn.Module):
     ) -> torch.Tensor:
         return torch.sum(a * b, dim=(1, 2, 3), keepdim=True)
 
-    def apply_A(
+    def apply_normal_operator(
         self,
         x: torch.Tensor,
         mu: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Applies:
+        return self.K.T(self.K(x)) + mu * x
 
-            A(x) = K^T K x + mu x
-
-        K and K.T are forced to float32 because the underlying blur operator
-        does not support AMP float16 kernels.
-        """
-
-        with torch.amp.autocast("cuda", enabled=False): # type: ignore
-            x32 = x.float()
-            mu32 = mu.float()
-
-            result32 = self.K.T(self.K(x32)) + mu32 * x32
-
-        return result32
-
-    def conjugate_gradient(
+    def __call__(
         self,
-        b: torch.Tensor,
-        x0: torch.Tensor,
+        y_delta: torch.Tensor,
+        z: torch.Tensor,
         mu: torch.Tensor,
+        starting_point: torch.Tensor | None = None,
+        maxiter: int = 10,
+        tol: float = 1e-6,
     ) -> torch.Tensor:
-        """
-        Solves approximately:
 
-            (K^T K + mu I)x = b
+        y_delta = y_delta.float()
+        z = z.float()
 
-        using fixed-iteration conjugate gradient.
-        CG is kept in float32 for numerical stability.
-        """
+        mu = mu.float().view(1, 1, 1, 1)
 
-        with torch.amp.autocast("cuda", enabled=False): # type: ignore
-            x = x0.float()
-            b = b.float()
-            mu = mu.float()
+        if starting_point is None:
+            x = z.clone()
+        else:
+            x = starting_point.float().clone()
 
-            r = b - self.apply_A(x, mu)
-            p = r
+        b = self.K.T(y_delta) + mu * z
 
-            rs_old = self.batch_dot(r, r)
+        r = b - self.apply_normal_operator(x, mu)
+        p = r.clone()
 
-            eps = 1e-8
+        rs_old = self.batch_dot(r, r)
+        rs_initial = rs_old.clone()
 
-            for _ in range(self.cg_iters):
-                Ap = self.apply_A(p, mu)
+        eps = 1e-8
 
-                alpha = rs_old / (self.batch_dot(p, Ap) + eps)
+        for _ in range(maxiter):
+            Ap = self.apply_normal_operator(p, mu)
 
-                x = x + alpha * p
-                r = r - alpha * Ap
+            alpha = rs_old / (self.batch_dot(p, Ap) + eps)
 
-                rs_new = self.batch_dot(r, r)
+            x = x + alpha * p
+            r = r - alpha * Ap
 
-                beta = rs_new / (rs_old + eps)
-                p = r + beta * p
+            rs_new = self.batch_dot(r, r)
 
-                rs_old = rs_new
+            relative_residual = torch.sqrt(rs_new / (rs_initial + eps))
+
+            if relative_residual.mean() < tol:
+                break
+
+            beta = rs_new / (rs_old + eps)
+
+            p = r + beta * p
+            rs_old = rs_new
 
         return x
+    
+class HQSLayer(nn.Module):
+    def __init__(
+        self,
+        K,
+        denoiser: NAFNet,
+        initial_mu: float = 1.0,
+        cg_iters: int = 10,
+        freeze_denoiser: bool = True,
+    ) -> None:
+        super().__init__()
+
+        self.K = K
+        self.denoiser = denoiser
+        self.cg_iters = cg_iters
+        self.freeze_denoiser = freeze_denoiser
+        self.cg_solver = HQSCG(K)
+
+        self.raw_mu = nn.Parameter(
+            torch.log(torch.expm1(torch.tensor(initial_mu)))
+        )
+
+    def get_mu(self) -> torch.Tensor:
+        return F.softplus(self.raw_mu) + 1e-8
 
     def forward(
         self,
@@ -1491,28 +1475,26 @@ class HQSLayer(nn.Module):
 
         original_dtype = x.dtype
 
+        x_for_denoiser = x.clamp(0.0, 1.0)
+
         if self.freeze_denoiser:
             with torch.no_grad():
-                z = self.denoiser(x).clamp(0.0, 1.0)
+                z = self.denoiser(x_for_denoiser)
         else:
-            z = self.denoiser(x).clamp(0.0, 1.0)
+            z = self.denoiser(x_for_denoiser)
+
+        z = z.clamp(0.0, 1.0)
 
         mu = self.get_mu()
 
-        with torch.amp.autocast("cuda", enabled=False): # type: ignore
-            y32 = y_delta.float()
-            z32 = z.float()
-            mu32 = mu.float()
-
-            b = self.K.T(y32) + mu32 * z32
-
-        x = self.conjugate_gradient(
-            b=b,
-            x0=x.float(),
-            mu=mu,
-        )
-
-        x = x.clamp(0.0, 1.0)
+        with torch.amp.autocast("cuda", enabled=False):  # type: ignore
+            x = self.cg_solver(
+                y_delta=y_delta.float(),
+                z=z.float(),
+                mu=mu.float(),
+                starting_point=x.float(),
+                maxiter=self.cg_iters,
+            )
 
         return x.to(dtype=original_dtype), z
 
@@ -1522,8 +1504,8 @@ class HQSNet(nn.Module):
         K,
         denoiser: NAFNet,
         checkpoint_path: str = "./weights/NAFNet/NAFImgDenoise.pth",
-        n_layers: int = 10,
-        cg_iters: int = 5,
+        n_layers: int = 5,
+        cg_iters: int = 10,
         initial_mu: float = 0.1,
         device: torch.device | str = "cuda" if torch.cuda.is_available() else "cpu",
     ) -> None:
@@ -1948,3 +1930,34 @@ class HQSNetModel:
             )
 
         return history
+    
+class DRUNetDenoiser(nn.Module):
+    def __init__(self, model: nn.Module):
+        super().__init__()
+        self.model = model
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        sigma: float | torch.Tensor,
+    ) -> torch.Tensor:
+
+        if isinstance(sigma, float):
+            sigma = torch.tensor(
+                sigma,
+                device=x.device,
+                dtype=x.dtype,
+            )
+
+        sigma_map = torch.ones(
+            x.shape[0],
+            1,
+            x.shape[2],
+            x.shape[3],
+            device=x.device,
+            dtype=x.dtype,
+        ) * sigma
+
+        inp = torch.cat([x, sigma_map], dim=1)
+
+        return self.model(inp)
