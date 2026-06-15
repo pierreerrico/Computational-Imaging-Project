@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 from torch.nn.utils import spectral_norm
 import torch.nn.functional as F
-from tqdm import tqdm
+from tqdm.auto import tqdm
 from utilities.plotter import plot
 
 class GeneratorResidualBlock(nn.Module):
