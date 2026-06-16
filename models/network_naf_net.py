@@ -6,7 +6,7 @@ from IPPy.utilities.metrics import PSNR, SSIM
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
-from Project.utilities.degradation import DegradationParameters, ImageDegradation
+from utilities.degradation import DegradationParameters, ImageDegradation
 from focal_frequency_loss import FocalFrequencyLoss
 from utilities.plotter import plot
 
